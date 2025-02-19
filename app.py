@@ -14,10 +14,7 @@ def _(mo):
 def _():
     # Define the types of datasets which can be read in
     cirro_dataset_type_filter = [
-        "process-hutch-differential-expression-1_0",
-        "process-hutch-differential-expression-custom-1_0",
-        "differential-expression-table",
-        "process-nf-core-differentialabundance-1_5"
+        "custom_dataset"
     ]
     return (cirro_dataset_type_filter,)
 
@@ -73,7 +70,7 @@ async def _(micropip, mo, running_in_wasm):
         import base64
         from urllib.parse import quote_plus
 
-        from cirro import DataPortalLogin
+        from cirro import DataPortalLogin, DataPortalDataset
         from cirro.services.file import FileService
         from cirro.sdk.file import DataPortalFile
         from cirro.config import list_tenants
@@ -84,6 +81,7 @@ async def _(micropip, mo, running_in_wasm):
             pyodide_patch_all()
     return (
         BytesIO,
+        DataPortalDataset,
         DataPortalFile,
         DataPortalLogin,
         Dict,
@@ -260,425 +258,79 @@ def _(client, dataset_ui, mo, project_ui):
     # Stop if the user has not selected a dataset
     mo.stop(dataset_ui.value is None)
 
-    # Get the list of files within the selected dataset
-    file_list = [
-        file.name
-        for file in (
-            client
-            .get_project_by_id(project_ui.value)
-            .get_dataset_by_id(dataset_ui.value)
-            .list_files()
-        )
-    ]
-    return (file_list,)
-
-
-@app.cell
-def _(file_list, mo, query_params):
-    # Let the user select which file to get data from
-    file_ui = mo.ui.dropdown(
-        value=(query_params.get("file") if query_params.get("file") in file_list else None),
-        options=file_list,
-        on_change=lambda i: query_params.set("file", i)
-    )
-    file_ui
-    return (file_ui,)
-
-
-@app.cell
-def _(mo, query_params):
-    # Let the user provide information about the file format
-    sep_ui = mo.ui.dropdown(
-        ["comma", "tab", "space"],
-        value=query_params.get("sep", "comma"),
-        label="Field Separator"
-    )
-    sep_ui
-    return (sep_ui,)
-
-
-@app.cell
-def _(client, dataset_ui, file_ui, mo, project_ui, sep_ui):
-    # If the file was selected
-    mo.stop(file_ui.value is None)
-
-    # Read the table
-    df = (
+    # Get the dataset object
+    dataset = (
         client
         .get_project_by_id(project_ui.value)
         .get_dataset_by_id(dataset_ui.value)
-        .list_files()
-        .get_by_id(file_ui.value)
-        # Set the delimiter used to read the file based on the menu selection
-        .read_csv(sep=dict(comma=",", tab="\t", space=" ")[sep_ui.value])
     )
-    return (df,)
+    return (dataset,)
 
 
 @app.cell
-def _():
-    # Helper when trying to guess the right column in the input table to use
-    def guess_column(l, options):
-        for i in l:
-            if isinstance(i, str) and i.lower() in options:
-                return i
-    return (guess_column,)
+def _(DataPortalDataset, Dict, mo, pd):
+    # Read all of the data as a single object
+    class Data:
+
+        _ds: DataPortalDataset
+        data: Dict[str, pd.DataFrame]
+
+        def __init__(self, ds: DataPortalDataset):
+
+            self._ds = ds
+
+            self.read_data()
+
+            self.key_umaps()
+
+        def read_data(self):
+            """Read all of the CSVs in the dataset to the self.data object (keyed on filepath)."""
+            self.data = dict()
+
+            # Get the list of files that will be read in
+            files_to_read = [
+                file
+                for file in self._ds.list_files()
+                if file.name.endswith(".csv") or file.name.endswith(".csv.gz")
+            ]
+
+            # Make a progress bar
+            for file in mo.status.progress_bar(
+                files_to_read,
+                title="Loading Data",
+                remove_on_exit=True,
+                subtitle="Reading all CSVs in dataset"
+            ):
+                key = (
+                    (file.name[len("data/"):] if file.name.startswith("data/") else file.name)
+                    .lower()
+                )
+                self.data[key] = file.read_csv()
+    return (Data,)
 
 
 @app.cell
-def _(df, guess_column, mo, query_params):
-    # Let the user select parameters for the display
-    params_ui = (
-        mo.md("""
-    ## Display Settings
+def _(Data, dataset):
+    data = Data(dataset)
+    return (data,)
 
-    ### Input Data
 
-    {pval_cname}<br>
-    {max_pval}<br>
-    {lfc_cname}<br>
-    {min_lfc}<br>
-    {abund_cname}<br>
-    {abund_log}<br>
-    {label_cname}<br>
+@app.cell
+def _(data, px):
+    # Plot the consensus peaks
 
-    ### Display Labels
-
-    {pval_label}<br>
-    {lfc_label}<br>
-    {abund_label}<br>
-
-    ### Plot Settings
-
-    {theme}
-    {width}
-    {height}
-        """)
-        .batch(
-            pval_cname=mo.ui.dropdown(
-                label="p-value:",
-                options=df.columns,
-                value=query_params.get(
-                    'pval_cname',
-                    guess_column(df.columns.values, ['pval', 'pvalue', 'p-value'])
-                )
-            ),
-            max_pval=mo.ui.text(
-                label="max p:",
-                value=query_params.get("max_pval", "0.05")
-            ),
-            abund_cname=mo.ui.dropdown(
-                label="abundance:",
-                options=df.columns,
-                value=query_params.get(
-                    'abund_cname',
-                    guess_column(df.columns.values, ['basemean', 'mean_abund', 'meanabund', 'base_mean'])
-                )
-            ),
-            abund_log=mo.ui.checkbox(
-                label="log-scale abundance",
-                value=bool(query_params.get("abund_log", True))
-            ),
-            lfc_cname=mo.ui.dropdown(
-                label="fold change:",
-                options=df.columns,
-                value=query_params.get(
-                    'lfc_cname',
-                    guess_column(df.columns.values, ['logfc', 'foldchange', 'fold_change', 'log_fold_change'])
-                )
-            ),
-            min_lfc=mo.ui.text(
-                label="min fold change",
-                value=query_params.get("min_lfc", "2")
-            ),
-            label_cname=mo.ui.dropdown(
-                label="gene name:",
-                options=df.columns,
-                value=query_params.get(
-                    'label_cname',
-                    guess_column(df.columns.values, ['gene_id', 'geneid', 'gene_name', 'genename'])
-                )
-            ),
-            pval_label=mo.ui.text(
-                value=query_params.get("pval_label", "p-value (-log10)")
-            ),
-            lfc_label=mo.ui.text(
-                value=query_params.get("lfc_label", "Fold Change (log2)")
-            ),
-            abund_label=mo.ui.text(
-                value=query_params.get("abund_label", "Mean Abundance (RPKM)")
-            ),
-            theme=mo.ui.dropdown(
-                label="Theme:",
-                options=["plotly", "plotly_white", "plotly_dark", "ggplot2", "seaborn", "simple_white", "none"],
-                value=query_params.get("theme", "none")
-            ),
-            width=mo.ui.number(
-                label="Width:",
-                value=int(query_params.get("width", 600)),
-                start=100,
-                stop=2400,
-                step=10
-            ),
-            height=mo.ui.number(
-                label="Height:",
-                value=int(query_params.get("height", 400)),
-                start=100,
-                stop=2400,
-                step=10
-            )
-        )
+    fig = px.bar(
+        data.data["csv/consensus_peaks.csv"],
+        y="nconp",
+        x="target",
+        color="caller",
+        title="Consensus Peaks",
+        barmode="group",
+        template="simple_white",
+        labels=dict(nconp="Number of Peaks", caller="Caller", target="Target")
     )
-    mo.sidebar(params_ui)
-    return (params_ui,)
-
-
-@app.cell
-def _(params_ui):
-    # Map the params to a single dict for brevity
-    params = params_ui.value
-    return (params,)
-
-
-@app.cell
-def _(df, mo, np, params):
-    max_pval = None
-    min_lfc = None
-    user_feedback = ""
-    if df is not None:
-        with mo.status.spinner("Preparing data"):
-            prepared_df = df.copy()
-
-            # Set any 0 pvalues to a minimum value (for plotting), and apply the -log10 transform
-            min_pval = df.query(f'{params["pval_cname"]} > 0')[params["pval_cname"]].min()
-            prepared_df = prepared_df.assign(**{
-                "_neg_log10_pval": -prepared_df[params["pval_cname"]].clip(lower=min_pval).apply(np.log10)
-            })
-
-            # Set the thresholds for maximum pvalue and minimum fold change
-            if params.get("max_pval") is not None:
-                try:
-                    max_pval = float(params["max_pval"])
-                except:
-                    user_feedback += f"Could not convert p-value threshold to a float ({params['max_pval']})\n\n"
-
-            if params.get("min_lfc") is not None:
-                try:
-                    min_lfc = float(params["min_lfc"])
-                except:
-                    user_feedback += f"Could not convert fold change threshold to a float ({params['min_lfc']})\n\n"
-
-            prepared_df = prepared_df.assign(
-                passes_threshold=prepared_df.apply(
-                    lambda r: (
-                        ((max_pval is None) or (r[params["pval_cname"]] <= max_pval))
-                        and
-                        ((min_lfc is None) or (np.abs(r[params["lfc_cname"]]) >= min_lfc))
-                    ),
-                    axis=1
-                )
-            )
-
-    else:
-        prepared_df = None
-
-    mo.md(user_feedback)
-    return max_pval, min_lfc, min_pval, prepared_df, user_feedback
-
-
-@app.cell
-def _(mo, volcano_fig):
-    if volcano_fig is not None:
-        volcano_header = mo.md("## Volcano Plot")
-    else:
-        volcano_header = None
-
-    volcano_header
-    return (volcano_header,)
-
-
-@app.cell
-def _(df, max_pval, min_lfc, mo, np, params, prepared_df, px):
-    if df is not None:
-        with mo.status.spinner("Making plot"):
-            volcano_fig = px.scatter(
-                data_frame=prepared_df,
-                x=params["lfc_cname"],
-                y="_neg_log10_pval",
-                labels={
-                    "_neg_log10_pval": params["pval_label"],
-                    params["lfc_cname"]: params["lfc_label"],
-                    params["abund_cname"]: params["abund_label"],
-                    "passes_threshold": "Passes Threshold",
-                },
-                color="passes_threshold",
-                hover_name=params["label_cname"],
-                hover_data=[params["pval_cname"], params["abund_cname"]],
-                template=params["theme"],
-                width=params["width"],
-                height=params["height"]
-            )
-            volcano_fig.update_layout(
-                plot_bgcolor="white",  # Set plot background color
-                paper_bgcolor="white", # Set paper background color
-                xaxis=dict(
-                    showgrid=True,  # Show grid lines on the x-axis
-                    gridcolor='lightgray'  # Set the color of the grid lines
-                ),
-                yaxis=dict(
-                    showgrid=True,  # Show grid lines on the y-axis
-                    gridcolor='lightgray'  # Set the color of the grid lines
-                )
-            )
-            if max_pval is not None:
-                volcano_fig.add_hline(-np.log10(max_pval), line_dash="dash", line_color="grey", opacity=0.5)
-            if min_lfc is not None:
-                volcano_fig.add_vline(min_lfc, line_dash="dash", line_color="grey", opacity=0.5)
-                volcano_fig.add_vline(-min_lfc, line_dash="dash", line_color="grey", opacity=0.5)
-    else:
-        volcano_fig = None
-
-    volcano_fig
-    return (volcano_fig,)
-
-
-@app.cell
-def _(ma_fig, mo):
-    if ma_fig is not None:
-        ma_header = mo.md("## M-A Plot")
-    else:
-        ma_header = None
-
-    ma_header
-    return (ma_header,)
-
-
-@app.cell
-def _(df, min_lfc, mo, params, prepared_df, px):
-    if df is not None:
-        with mo.status.spinner("Making plot"):
-            ma_fig = px.scatter(
-                data_frame=prepared_df,
-                x=params["lfc_cname"],
-                y=params["abund_cname"],
-                color="passes_threshold",
-                labels={
-                    "_neg_log10_pval": params["pval_label"],
-                    params["lfc_cname"]: params["lfc_label"],
-                    params["abund_cname"]: params["abund_label"],
-                    "passes_threshold": "Passes Threshold",
-                },
-                hover_name=params["label_cname"],
-                hover_data=[params["pval_cname"], params["abund_cname"]],
-                log_y=params["abund_log"],
-                template=params["theme"],
-                width=params["width"],
-                height=params["height"]
-            )
-            ma_fig.update_layout(
-                plot_bgcolor="white",  # Set plot background color
-                paper_bgcolor="white", # Set paper background color
-                xaxis=dict(
-                    showgrid=True,  # Show grid lines on the x-axis
-                    gridcolor='lightgray'  # Set the color of the grid lines
-                ),
-                yaxis=dict(
-                    showgrid=True,  # Show grid lines on the y-axis
-                    gridcolor='lightgray'  # Set the color of the grid lines
-                )
-            )
-            if min_lfc is not None:
-                ma_fig.add_vline(min_lfc, line_dash="dash", line_color="grey", opacity=0.5)
-                ma_fig.add_vline(-min_lfc, line_dash="dash", line_color="grey", opacity=0.5)
-
-    else:
-        ma_fig = None
-
-    ma_fig
-    return (ma_fig,)
-
-
-@app.cell
-def _(mo, three_dim_fig):
-    if three_dim_fig is not None:
-        three_dim_header = mo.md("## 3D Plot")
-    else:
-        three_dim_header = None
-
-    three_dim_header
-    return (three_dim_header,)
-
-
-@app.cell
-def _(df, mo, params, prepared_df, px):
-    if df is not None:
-        with mo.status.spinner("Making plot"):
-            three_dim_fig = px.scatter_3d(
-                data_frame=prepared_df,
-                x=params["lfc_cname"],
-                y="_neg_log10_pval",
-                z=params["abund_cname"],
-                color="passes_threshold",
-                labels={
-                    "_neg_log10_pval": params["pval_label"],
-                    params["lfc_cname"]: params["lfc_label"],
-                    params["abund_cname"]: params["abund_label"],
-                    "passes_threshold": "Passes Threshold",
-                },
-                hover_name=params["label_cname"],
-                hover_data=[params["pval_cname"], params["abund_cname"]],
-                log_z=params["abund_log"],
-                template=params["theme"],
-                width=params["width"],
-                height=params["height"]
-            )
-
-    else:
-        three_dim_fig = None
-
-    three_dim_fig
-    return (three_dim_fig,)
-
-
-@app.cell
-def _(prepared_df):
-    # Show the DataFrame with the rows passing the filter
-    (
-        prepared_df
-        .query("passes_threshold")
-        .drop(columns=[
-            "passes_threshold",
-            "_neg_log10_pval"
-        ])
-    )
-    return
-
-
-@app.cell
-def _(mo, params, query_params, volcano_fig):
-    if volcano_fig is not None:
-        permalink = mo.md(
-            (
-                "[Permalink](https://fredhutch.github.io/differential-expression-viewer?{_query_params})"
-                .format(
-                    _query_params="&".join([
-                        f"{kw}={str(val)}"
-                        for kw, val in {
-                            **{
-                                kw: query_params.get(kw)
-                                for kw in ["url", "domain", "project", "dataset", "file"]
-                            },
-                            **params
-                        }.items()
-                        if val is not None
-                    ])
-                )
-            )
-        )
-    else:
-        permalink = None
-    permalink
-    return (permalink,)
+    fig
+    return (fig,)
 
 
 @app.cell
