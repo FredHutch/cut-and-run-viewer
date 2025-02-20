@@ -1,7 +1,7 @@
 import marimo
 
 __generated_with = "0.11.0"
-app = marimo.App(width="medium", app_title="Differential Expression Viewer")
+app = marimo.App(width="medium", app_title="CUT")
 
 
 @app.cell
@@ -54,8 +54,8 @@ async def _(micropip, mo, running_in_wasm):
             micropip.uninstall("httpx")
             await micropip.install(["urllib3==2.3.0"])
             await micropip.install([
-                "boto3==1.36.3",
-                "botocore==1.36.3"
+                "boto3==1.36.23",
+                "botocore==1.36.23"
             ], verbose=True)
             await micropip.install(["cirro[pyodide]>=1.2.16"], verbose=True)
 
@@ -268,20 +268,88 @@ def _(client, dataset_ui, mo, project_ui):
 
 
 @app.cell
-def _(DataPortalDataset, Dict, mo, pd):
+def _(np, pd):
+    def calc_clr(vals: pd.Series):
+        """Calculate the Centered Log Ratio for a vector of counts."""
+        nonzero_vals = vals.loc[vals > 0]
+        log_values = nonzero_vals.apply(np.log10)
+        gmean = log_values.mean()
+        return log_values / gmean
+        
+    return (calc_clr,)
+
+
+@app.cell
+def _(DataPortalDataset, Dict, Tuple, calc_clr, mo, pd):
     # Read all of the data as a single object
     class Data:
 
         _ds: DataPortalDataset
         data: Dict[str, pd.DataFrame]
+        umaps: Dict[Tuple(str, str), pd.DataFrame]
+        counts: Dict[Tuple(str, str), pd.DataFrame]
+        clr: Dict[Tuple(str, str), pd.DataFrame]
+        all_marks = []
+        all_callers = []
 
         def __init__(self, ds: DataPortalDataset):
 
             self._ds = ds
 
             self.read_data()
+            self.merge_umap_tables()
+            self.format_counts()
 
-            self.key_umaps()
+        def format_counts(self):
+            self.counts = {}
+            self.clr = {}
+            key_prefix = "analysis/08_differential_peaks/"
+            key_suffix = "/rawcounts.txt"
+            keys_to_parse = [
+                key
+                for key in self.data.keys()
+                if key.startswith(key_prefix) and key.endswith(key_suffix)
+            ]
+            for key in mo.status.progress_bar(keys_to_parse, title="Formatting Counts", remove_on_exit=True):
+                mark, caller = key[len(key_prefix):-len(key_suffix)].split('.')
+                df = self.data[key]
+
+                index_cols = ["chrom", "start", "end", "conp.id", "sample.groups", "npeak", "length"]
+                for cname in index_cols:
+                    assert cname in df.columns.values, f"Expected to find {cname} in {key}"
+
+                    # Save the counts
+                    self.counts[(mark, caller)] = df.set_index(index_cols)
+
+                    # Also compute the centered log ratio
+                    self.clr[(mark, caller)] = self.counts[(mark, caller)].apply(calc_clr).fillna(0)
+
+        def merge_umap_tables(self):
+            # Keep track of all of the UMAP merged tables
+            self.umaps = dict()
+            self.all_callers = []
+            self.all_marks = []
+
+            keys_to_merge = [
+                key
+                for key in self.data.keys()
+                if key.startswith("umaps/")
+            ]
+            for key in mo.status.progress_bar(keys_to_merge, title="Formatting UMAPs", remove_on_exit=True):
+                mark, caller = key[len("umaps/"):-len(".csv")].split('.')
+                if mark not in self.all_marks:
+                    self.all_marks.append(mark)
+                if caller not in self.all_callers:
+                    self.all_callers.append(caller)
+
+                analysis_key = f"analysis/07_consensus_peaks_by_target/_annotation/{mark}.{caller}.annotation.txt"
+                assert analysis_key in self.data, f"Could not find analysis ({analysis_key})"
+                merged_table = self.data[key].merge(
+                    self.data[analysis_key],
+                    left_on=self.data[key].columns.values[0],
+                    right_on=self.data[analysis_key].columns.values[0]
+                )
+                self.umaps[(mark, caller)] = merged_table                
 
         def read_data(self):
             """Read all of the CSVs in the dataset to the self.data object (keyed on filepath)."""
@@ -291,7 +359,12 @@ def _(DataPortalDataset, Dict, mo, pd):
             files_to_read = [
                 file
                 for file in self._ds.list_files()
-                if file.name.endswith(".csv") or file.name.endswith(".csv.gz")
+                if (
+                    file.name.endswith(".csv") or
+                    file.name.endswith(".csv.gz") or
+                    file.name.endswith(".annotation.txt") or
+                    file.name.endswith("rawCounts.txt")
+                )
             ]
 
             # Make a progress bar
@@ -299,13 +372,22 @@ def _(DataPortalDataset, Dict, mo, pd):
                 files_to_read,
                 title="Loading Data",
                 remove_on_exit=True,
-                subtitle="Reading all CSVs in dataset"
+                subtitle="Reading all CSVs/TSVs in dataset"
             ):
                 key = (
                     (file.name[len("data/"):] if file.name.startswith("data/") else file.name)
                     .lower()
                 )
-                self.data[key] = file.read_csv()
+                self.data[key] = file.read_csv(
+                    sep=(
+                        "," if "csv"
+                        in file.name
+                        else (
+                            " " if file.name.endswith("rawCounts.txt")
+                            else "\t"
+                        )
+                    )
+                )
     return (Data,)
 
 
@@ -316,21 +398,192 @@ def _(Data, dataset):
 
 
 @app.cell
-def _(data, px):
-    # Plot the consensus peaks
+def _(data, mo):
+    compare_samples_ui = (
+        mo.md("""
+    #### Compare Peaks Across Samples
+    {mark}
 
-    fig = px.bar(
-        data.data["csv/consensus_peaks.csv"],
-        y="nconp",
-        x="target",
-        color="caller",
-        title="Consensus Peaks",
-        barmode="group",
-        template="simple_white",
-        labels=dict(nconp="Number of Peaks", caller="Caller", target="Target")
+    {caller}
+        """)
+        .batch(
+            mark=mo.ui.dropdown(
+                data.all_marks,
+                label="Select Mark:"
+            ),
+            caller=mo.ui.dropdown(
+                data.all_callers,
+                label="Select Caller:"
+            )
+        )
     )
-    fig
-    return (fig,)
+    compare_samples_ui
+    return (compare_samples_ui,)
+
+
+@app.cell
+def _(compare_samples_ui, data, mo):
+    # When the user selects the mark and the caller, get the options for what
+    # samples have counts available
+    mo.stop(compare_samples_ui.value["mark"] is None or compare_samples_ui.value["caller"] is None)
+    compare_samples_options = data.clr[(
+        compare_samples_ui.value["mark"],
+        compare_samples_ui.value["caller"]
+    )].columns.values
+    return (compare_samples_options,)
+
+
+@app.cell
+def _(compare_samples_options, mo):
+    # Ask the user what samples to compare
+    compare_samples_groups_ui = (
+        mo.md("""
+    {groupA}
+
+    {groupB}
+    """)
+        .batch(
+            groupA=mo.ui.multiselect(
+                compare_samples_options,
+                label="Select Group A:"
+            ),
+            groupB=mo.ui.multiselect(
+                compare_samples_options,
+                label="Select Group B:"
+            )
+        )
+    )
+    compare_samples_groups_ui
+    return (compare_samples_groups_ui,)
+
+
+@app.cell
+def _(compare_samples_groups_ui, mo):
+    mo.md(f"""
+    Group A:
+
+    - {'\n - '.join(compare_samples_groups_ui.value["groupA"])}
+
+    Group B:
+
+    - {'\n - '.join(compare_samples_groups_ui.value["groupB"])}
+
+    """)
+    return
+
+
+@app.cell
+def _(mo):
+    with mo.status.spinner("Loading Dependencies:"):
+        import seaborn as sns
+        import matplotlib.pyplot as plt
+        from scipy import stats
+    return plt, sns, stats
+
+
+@app.cell
+def _(compare_samples_groups_ui, data, np, pd, stats):
+    def calc_mwu_p(vals: pd.Series):
+        # Get the samples in each group
+        groupA = compare_samples_groups_ui.value["groupA"]
+        groupB = compare_samples_groups_ui.value["groupB"]
+        valsA = vals.loc[groupA]
+        valsB = vals.loc[groupB]
+        mwu = stats.mannwhitneyu(valsA, valsB)
+        return mwu.pvalue
+
+    def calc_ttest_p(vals: pd.Series):
+        # Get the samples in each group
+        groupA = compare_samples_groups_ui.value["groupA"]
+        groupB = compare_samples_groups_ui.value["groupB"]
+        valsA = vals.loc[groupA]
+        valsB = vals.loc[groupB]
+        mwu = stats.ttest_ind(valsA, valsB)
+        return mwu.pvalue
+
+    def compare_samples_prep_data(mark: str, caller: str, groupA: list, groupB: list):
+
+        if mark is None or caller is None:
+            return
+        if len(groupA) == 0 or len(groupB) == 0:
+            return
+
+        # Get the table of counts (CLR transform)
+        df = data.clr[(mark, caller)]
+
+        # Split up the counts for each group
+        dfA = df.reindex(columns=groupA)
+        dfB = df.reindex(columns=groupB)
+
+        # Get the mean value for each and calculate the log-fold-change
+        merged = (
+            pd.DataFrame(dict(
+                meanA=dfA.mean(axis=1),
+                meanB=dfB.mean(axis=1),
+                # # Use Mann-Whitney U to compare both populations
+                # mwu_p=pd.concat([dfA, dfB], axis=1).apply(calc_mwu_p, axis=1),
+                # Also use a t-test
+                ttest_p=pd.concat([dfA, dfB], axis=1).apply(calc_ttest_p, axis=1),
+            ))
+            .query(
+                "meanA > 0 or meanB > 0"
+            )
+            .assign(
+                log10_fold_change=lambda d: d['meanA'] - d['meanB'],
+                mean_abund=lambda d: d[['meanA', 'meanB']].mean(axis=1),
+            )
+        )
+        merged = merged.assign(
+            # mwu_neg_log10_p=(-1 * (merged["mwu_p"].apply(np.log10))).apply(np.abs),
+            ttest_neg_log10_p=(-1 * (merged["ttest_p"].apply(np.log10))).apply(np.abs),
+        )
+
+        return merged.reset_index()
+
+    return calc_mwu_p, calc_ttest_p, compare_samples_prep_data
+
+
+@app.cell
+def _(
+    compare_samples_groups_ui,
+    compare_samples_prep_data,
+    compare_samples_ui,
+    mo,
+):
+    with mo.status.spinner("Preparing Data:"):
+        plot_df = compare_samples_prep_data(**compare_samples_ui.value, **compare_samples_groups_ui.value)
+    mo.stop(plot_df is None)
+    return (plot_df,)
+
+
+@app.cell
+def _(mo, pd, plot_df, px):
+    def compare_samples_plot(df: pd.DataFrame):
+        # Make a plot of the mean abundance and log fold change
+        fig = px.scatter(
+            df.sort_values(by="ttest_neg_log10_p", ascending=False).head(1000),
+            size="mean_abund",
+            color="mean_abund",
+            x="log10_fold_change",
+            y="ttest_neg_log10_p",
+            template="simple_white",
+            hover_name="conp.id",
+            hover_data=["chrom", "start", "end", "sample.groups", "ttest_p"],
+            color_continuous_scale="bluered",
+            labels=dict(
+                mean_abund="Mean Abundance (CLR)",
+                log10_fold_change="Fold Change (log10)",
+                ttest_neg_log10_p="t-test p-vlue (-log10)",
+                ttest_p="t-test p-value"
+            )
+        )
+
+        return mo.ui.plotly(fig)
+
+
+    compare_samples_plot_ui = compare_samples_plot(plot_df)
+    compare_samples_plot_ui
+    return compare_samples_plot, compare_samples_plot_ui
 
 
 @app.cell
