@@ -1,7 +1,7 @@
 import marimo
 
 __generated_with = "0.11.0"
-app = marimo.App(width="medium", app_title="CUT")
+app = marimo.App(width="medium", app_title="CUT&RUN Viewer")
 
 
 @app.cell
