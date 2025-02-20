@@ -459,14 +459,16 @@ def _(compare_samples_options, mo):
 
 @app.cell
 def _(compare_samples_groups_ui, mo):
+    group_list_a = '\n - '.join(compare_samples_groups_ui.value["groupA"])
+    group_list_b = '\n - '.join(compare_samples_groups_ui.value["groupB"])
     mo.md(f"""
     Group A:
 
-    - {'\n - '.join(compare_samples_groups_ui.value["groupA"])}
+    - {group_list_a}
 
     Group B:
 
-    - {'\n - '.join(compare_samples_groups_ui.value["groupB"])}
+    - {group_list_b}
 
     """)
     return
