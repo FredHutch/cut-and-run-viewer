@@ -668,7 +668,7 @@ def _(comp_df, mo):
     """).batch(
         peak=mo.ui.dropdown(
             label="Inspect Peak:",
-            options=comp_df["conp.id"].tolist(),
+            options=comp_df["conp.id"].sort_values().tolist(),
             value=comp_df["conp.id"].values[0]
         ),
         window_size=mo.ui.number(
