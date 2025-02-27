@@ -1,6 +1,6 @@
 import marimo
 
-__generated_with = "0.11.0"
+__generated_with = "0.11.10"
 app = marimo.App(width="medium", app_title="CUT&RUN Viewer")
 
 
@@ -50,6 +50,7 @@ async def _(micropip, mo, running_in_wasm):
             # Downgrade plotly to avoid the use of narwhals
             await micropip.install("plotly<6.0.0")
             await micropip.install("ssl")
+            await micropip.install("anndata")
             micropip.uninstall("urllib3")
             micropip.uninstall("httpx")
             await micropip.install(["urllib3==2.3.0"])
@@ -62,13 +63,16 @@ async def _(micropip, mo, running_in_wasm):
         from io import StringIO, BytesIO
         from queue import Queue
         from time import sleep
-        from typing import Dict, Optional
+        from typing import Dict, Optional, List
         import plotly.express as px
+        import plotly.graph_objects as go
         import pandas as pd
         import numpy as np
         from functools import lru_cache
         import base64
         from urllib.parse import quote_plus
+        from collections import defaultdict
+        from functools import lru_cache
 
         from cirro import DataPortalLogin, DataPortalDataset
         from cirro.services.file import FileService
@@ -86,10 +90,13 @@ async def _(micropip, mo, running_in_wasm):
         DataPortalLogin,
         Dict,
         FileService,
+        List,
         Optional,
         Queue,
         StringIO,
         base64,
+        defaultdict,
+        go,
         list_tenants,
         lru_cache,
         np,
@@ -121,12 +128,7 @@ def _(list_tenants):
 
     def name_to_domain(name):
         return tenants_by_name.get(name, {}).get("domain")
-    return (
-        domain_to_name,
-        name_to_domain,
-        tenants_by_domain,
-        tenants_by_name,
-    )
+    return domain_to_name, name_to_domain, tenants_by_domain, tenants_by_name
 
 
 @app.cell
@@ -218,6 +220,7 @@ def _(client):
 def _(id_to_name, mo, name_to_id, projects, query_params):
     # Let the user select which project to get data from
     project_ui = mo.ui.dropdown(
+        label="Select Project:",
         value=id_to_name(projects, query_params.get("project")),
         options=name_to_id(projects),
         on_change=lambda i: query_params.set("project", i)
@@ -245,6 +248,7 @@ def _(cirro_dataset_type_filter, client, mo, project_ui):
 def _(datasets, id_to_name, mo, name_to_id, query_params):
     # Let the user select which dataset to get data from
     dataset_ui = mo.ui.dropdown(
+        label="Select Dataset:",
         value=id_to_name(datasets, query_params.get("dataset")),
         options=name_to_id(datasets),
         on_change=lambda i: query_params.set("dataset", i)
@@ -254,16 +258,27 @@ def _(datasets, id_to_name, mo, name_to_id, query_params):
 
 
 @app.cell
-def _(client, dataset_ui, mo, project_ui):
+def _(DataPortalDataset, dataset_ui, get_client, lru_cache, project_ui):
+    @lru_cache
+    def get_dataset(project_id: str, dataset_id: str) -> DataPortalDataset:
+        _client = get_client()
+        if _client is None:
+            return
+        return (
+            _client
+            .get_project_by_id(project_ui.value)
+            .get_dataset_by_id(dataset_ui.value)
+        )
+    return (get_dataset,)
+
+
+@app.cell
+def _(dataset_ui, get_dataset, mo, project_ui):
     # Stop if the user has not selected a dataset
     mo.stop(dataset_ui.value is None)
 
     # Get the dataset object
-    dataset = (
-        client
-        .get_project_by_id(project_ui.value)
-        .get_dataset_by_id(dataset_ui.value)
-    )
+    dataset = get_dataset(project_ui.value, dataset_ui.value)
     return (dataset,)
 
 
@@ -275,81 +290,36 @@ def _(np, pd):
         log_values = nonzero_vals.apply(np.log10)
         gmean = log_values.mean()
         return log_values / gmean
-        
     return (calc_clr,)
 
 
 @app.cell
-def _(DataPortalDataset, Dict, Tuple, calc_clr, mo, pd):
+def _(DataPortalDataset, Dict, List, defaultdict, mo, np, pd):
     # Read all of the data as a single object
     class Data:
 
         _ds: DataPortalDataset
         data: Dict[str, pd.DataFrame]
-        umaps: Dict[Tuple(str, str), pd.DataFrame]
-        counts: Dict[Tuple(str, str), pd.DataFrame]
-        clr: Dict[Tuple(str, str), pd.DataFrame]
-        all_marks = []
-        all_callers = []
+        # Key differential peaks by mark, caller, and comparison
+        _differential_peaks: Dict[str, Dict[str, Dict[str, pd.DataFrame]]]
+        # Key peak annotations by mark and caller
+        _peak_annotations = Dict[str, Dict[str, pd.DataFrame]]
 
         def __init__(self, ds: DataPortalDataset):
 
             self._ds = ds
 
             self.read_data()
-            self.merge_umap_tables()
-            self.format_counts()
+            self.parse_differential_peaks()
+            self.parse_peak_annotations()
 
-        def format_counts(self):
-            self.counts = {}
-            self.clr = {}
-            key_prefix = "analysis/08_differential_peaks/"
-            key_suffix = "/rawcounts.txt"
-            keys_to_parse = [
-                key
-                for key in self.data.keys()
-                if key.startswith(key_prefix) and key.endswith(key_suffix)
-            ]
-            for key in mo.status.progress_bar(keys_to_parse, title="Formatting Counts", remove_on_exit=True):
-                mark, caller = key[len(key_prefix):-len(key_suffix)].split('.')
-                df = self.data[key]
-
-                index_cols = ["chrom", "start", "end", "conp.id", "sample.groups", "npeak", "length"]
-                for cname in index_cols:
-                    assert cname in df.columns.values, f"Expected to find {cname} in {key}"
-
-                    # Save the counts
-                    self.counts[(mark, caller)] = df.set_index(index_cols)
-
-                    # Also compute the centered log ratio
-                    self.clr[(mark, caller)] = self.counts[(mark, caller)].apply(calc_clr).fillna(0)
-
-        def merge_umap_tables(self):
-            # Keep track of all of the UMAP merged tables
-            self.umaps = dict()
-            self.all_callers = []
-            self.all_marks = []
-
-            keys_to_merge = [
-                key
-                for key in self.data.keys()
-                if key.startswith("umaps/")
-            ]
-            for key in mo.status.progress_bar(keys_to_merge, title="Formatting UMAPs", remove_on_exit=True):
-                mark, caller = key[len("umaps/"):-len(".csv")].split('.')
-                if mark not in self.all_marks:
-                    self.all_marks.append(mark)
-                if caller not in self.all_callers:
-                    self.all_callers.append(caller)
-
-                analysis_key = f"analysis/07_consensus_peaks_by_target/_annotation/{mark}.{caller}.annotation.txt"
-                assert analysis_key in self.data, f"Could not find analysis ({analysis_key})"
-                merged_table = self.data[key].merge(
-                    self.data[analysis_key],
-                    left_on=self.data[key].columns.values[0],
-                    right_on=self.data[analysis_key].columns.values[0]
-                )
-                self.umaps[(mark, caller)] = merged_table                
+            # Make sure that all of the marks and callers (parsed from the differential peaks)
+            # also have annotations available
+            for mark in self.marks():
+                for caller in self.callers(mark):
+                    assert self.peak_annotation(mark, caller) is not None, \
+                        f"Missing annotations for {mark} / {caller}"
+        
 
         def read_data(self):
             """Read all of the CSVs in the dataset to the self.data object (keyed on filepath)."""
@@ -360,10 +330,13 @@ def _(DataPortalDataset, Dict, Tuple, calc_clr, mo, pd):
                 file
                 for file in self._ds.list_files()
                 if (
-                    file.name.endswith(".csv") or
-                    file.name.endswith(".csv.gz") or
-                    file.name.endswith(".annotation.txt") or
-                    file.name.endswith("rawCounts.txt")
+                    # file.name.endswith(".csv") or
+                    # file.name.endswith(".csv.gz") or
+                    # file.name.endswith(".annotation.txt") or
+                    # file.name.endswith("rawCounts.txt")
+                    (file.name.endswith(".txt") and file.name.startswith("data/Analysis/08") and "_vs_" in file.name)
+                    or
+                    (file.name.endswith(".txt") and "_annotation" in file.name)
                 )
             ]
 
@@ -375,19 +348,74 @@ def _(DataPortalDataset, Dict, Tuple, calc_clr, mo, pd):
                 subtitle="Reading all CSVs/TSVs in dataset"
             ):
                 key = (
-                    (file.name[len("data/"):] if file.name.startswith("data/") else file.name)
-                    .lower()
+                    file.name[len("data/"):]
+                    if file.name.startswith("data/")
+                    else file.name
                 )
-                self.data[key] = file.read_csv(
-                    sep=(
-                        "," if "csv"
-                        in file.name
-                        else (
-                            " " if file.name.endswith("rawCounts.txt")
-                            else "\t"
+                try:
+                    self.data[key] = file.read_csv(
+                        sep=(
+                            "," if "csv"
+                            in file.name
+                            else (
+                                " " if file.name.endswith("rawCounts.txt")
+                                else "\t"
+                            )
                         )
                     )
-                )
+                except Exception as e:
+                    print(f"Problem reading {file.name}")
+                    raise e
+
+        def parse_peak_annotations(self):
+            """Key the peak annotations by mark and caller."""
+            self._peak_annotations = defaultdict(lambda: dict())
+
+            prefix_lower = "analysis/07_consensus_peaks_by_target/_annotation/"
+            suffix_lower = ".annotation.txt"
+            for key, df in self.data.items():
+                if key.lower().startswith(prefix_lower) and key.lower().endswith(suffix_lower):
+                    mark, caller = key[len(prefix_lower):-len(suffix_lower)].split(".", 1)
+                    self._peak_annotations[mark][caller] = (
+                        df
+                        .set_index(df.columns.values[0])
+                        .assign(
+                            Middle=lambda d: d.apply(lambda r: np.mean([r['Start'], r['End']]), axis=1)
+                        )
+                    )
+    
+        def peak_annotation(self, mark: str, caller: str):
+            return self._peak_annotations.get(mark, {}).get(caller)
+
+        def parse_differential_peaks(self):
+            """Key the differential peak results, key by mark, caller, and comparison."""
+            self._differential_peaks = defaultdict(lambda: defaultdict(lambda: dict()))
+
+            prefix_lower = "analysis/08_differential_peaks/"
+            for key, df in self.data.items():
+                if key.lower().startswith(prefix_lower):
+                    mark, caller = key[len(prefix_lower):].split("/")[0].split(".", 1)
+                    comparison = key[len(f"{prefix_lower}{mark}.{caller}/"):].split("/")[0]
+                    self._differential_peaks[mark][caller][comparison] = (
+                        df
+                        .assign(
+                            neg_log10_pvalue=df["PValue"].apply(np.log10) * -1,
+                            signed_log10_pvalue=lambda d: d.apply(lambda r: r["neg_log10_pvalue"] * (1 if r["logFC"] < 0 else -1), axis=1)
+                        )
+                        .sort_values(by="PValue")
+                    )
+
+        def marks(self) -> List[str]:
+            return list(self._differential_peaks.keys())
+
+        def callers(self, mark) -> List[str]:
+            return list(self._differential_peaks[mark].keys())
+
+        def comparisons(self, mark: str, caller: str) -> List[str]:
+            return list(self._differential_peaks[mark][caller].keys())
+
+        def differential_peak(self, mark: str, caller: str, comparison: str) -> pd.DataFrame:
+            return self._differential_peaks[mark][caller][comparison]
     return (Data,)
 
 
@@ -398,194 +426,371 @@ def _(Data, dataset):
 
 
 @app.cell
-def _(data, mo):
-    compare_samples_ui = (
-        mo.md("""
-    #### Compare Peaks Across Samples
-    {mark}
-
-    {caller}
-        """)
-        .batch(
-            mark=mo.ui.dropdown(
-                data.all_marks,
-                label="Select Mark:"
-            ),
-            caller=mo.ui.dropdown(
-                data.all_callers,
-                label="Select Caller:"
-            )
-        )
-    )
-    compare_samples_ui
-    return (compare_samples_ui,)
-
-
-@app.cell
-def _(compare_samples_ui, data, mo):
-    # When the user selects the mark and the caller, get the options for what
-    # samples have counts available
-    mo.stop(compare_samples_ui.value["mark"] is None or compare_samples_ui.value["caller"] is None)
-    compare_samples_options = data.clr[(
-        compare_samples_ui.value["mark"],
-        compare_samples_ui.value["caller"]
-    )].columns.values
-    return (compare_samples_options,)
-
-
-@app.cell
-def _(compare_samples_options, mo):
-    # Ask the user what samples to compare
-    compare_samples_groups_ui = (
-        mo.md("""
-    {groupA}
-
-    {groupB}
-    """)
-        .batch(
-            groupA=mo.ui.multiselect(
-                compare_samples_options,
-                label="Select Group A:"
-            ),
-            groupB=mo.ui.multiselect(
-                compare_samples_options,
-                label="Select Group B:"
-            )
-        )
-    )
-    compare_samples_groups_ui
-    return (compare_samples_groups_ui,)
-
-
-@app.cell
-def _(compare_samples_groups_ui, mo):
-    group_list_a = '\n - '.join(compare_samples_groups_ui.value["groupA"])
-    group_list_b = '\n - '.join(compare_samples_groups_ui.value["groupB"])
-    mo.md(f"""
-    Group A:
-
-    - {group_list_a}
-
-    Group B:
-
-    - {group_list_b}
-
-    """)
-    return
-
-
-@app.cell
 def _(mo):
-    with mo.status.spinner("Loading Dependencies:"):
-        import seaborn as sns
-        import matplotlib.pyplot as plt
-        from scipy import stats
-    return plt, sns, stats
+    # Use state elements to keep the same selections even if one changes
+    get_mark, set_mark = mo.state(None)
+    get_caller, set_caller = mo.state(None)
+    get_comparison, set_comparison = mo.state(None)
+    return (
+        get_caller,
+        get_comparison,
+        get_mark,
+        set_caller,
+        set_comparison,
+        set_mark,
+    )
 
 
 @app.cell
-def _(compare_samples_groups_ui, data, np, pd, stats):
-    def calc_mwu_p(vals: pd.Series):
-        # Get the samples in each group
-        groupA = compare_samples_groups_ui.value["groupA"]
-        groupB = compare_samples_groups_ui.value["groupB"]
-        valsA = vals.loc[groupA]
-        valsB = vals.loc[groupB]
-        mwu = stats.mannwhitneyu(valsA, valsB)
-        return mwu.pvalue
-
-    def calc_ttest_p(vals: pd.Series):
-        # Get the samples in each group
-        groupA = compare_samples_groups_ui.value["groupA"]
-        groupB = compare_samples_groups_ui.value["groupB"]
-        valsA = vals.loc[groupA]
-        valsB = vals.loc[groupB]
-        mwu = stats.ttest_ind(valsA, valsB)
-        return mwu.pvalue
-
-    def compare_samples_prep_data(mark: str, caller: str, groupA: list, groupB: list):
-
-        if mark is None or caller is None:
-            return
-        if len(groupA) == 0 or len(groupB) == 0:
-            return
-
-        # Get the table of counts (CLR transform)
-        df = data.clr[(mark, caller)]
-
-        # Split up the counts for each group
-        dfA = df.reindex(columns=groupA)
-        dfB = df.reindex(columns=groupB)
-
-        # Get the mean value for each and calculate the log-fold-change
-        merged = (
-            pd.DataFrame(dict(
-                meanA=dfA.mean(axis=1),
-                meanB=dfB.mean(axis=1),
-                # # Use Mann-Whitney U to compare both populations
-                # mwu_p=pd.concat([dfA, dfB], axis=1).apply(calc_mwu_p, axis=1),
-                # Also use a t-test
-                ttest_p=pd.concat([dfA, dfB], axis=1).apply(calc_ttest_p, axis=1),
-            ))
-            .query(
-                "meanA > 0 or meanB > 0"
-            )
-            .assign(
-                log10_fold_change=lambda d: d['meanA'] - d['meanB'],
-                mean_abund=lambda d: d[['meanA', 'meanB']].mean(axis=1),
-            )
+def _(List):
+    def dropdown_options(label: str, options: List[str], value: str, on_change: callable):
+        return dict(
+            label=label,
+            options=options,
+            value=value if value in options else None,
+            on_change=on_change
         )
-        merged = merged.assign(
-            # mwu_neg_log10_p=(-1 * (merged["mwu_p"].apply(np.log10))).apply(np.abs),
-            ttest_neg_log10_p=(-1 * (merged["ttest_p"].apply(np.log10))).apply(np.abs),
-        )
+    return (dropdown_options,)
 
-        return merged.reset_index()
 
-    return calc_mwu_p, calc_ttest_p, compare_samples_prep_data
+@app.cell
+def _(data, dropdown_options, get_mark, mo, set_mark):
+    # Ask the user which mark to inspect
+    select_mark_ui = mo.ui.dropdown(**dropdown_options(
+        label="Select Mark:",
+        options=data.marks(),
+        value=get_mark(),
+        on_change=set_mark
+    ))
+    select_mark_ui
+    return (select_mark_ui,)
+
+
+@app.cell
+def _(data, dropdown_options, get_caller, mo, select_mark_ui, set_caller):
+    mo.stop(select_mark_ui.value is None)
+    selected_mark = select_mark_ui.value
+    callers = data.callers(selected_mark)
+
+    # Ask the user which caller to use
+    select_caller_ui = mo.ui.dropdown(**dropdown_options(
+        label="Select Caller:",
+        options=callers,
+        value=get_caller(),
+        on_change=set_caller
+    ))
+    select_caller_ui
+    return callers, select_caller_ui, selected_mark
 
 
 @app.cell
 def _(
-    compare_samples_groups_ui,
-    compare_samples_prep_data,
-    compare_samples_ui,
+    data,
+    dropdown_options,
+    get_comparison,
     mo,
+    select_caller_ui,
+    selected_mark,
+    set_comparison,
 ):
-    with mo.status.spinner("Preparing Data:"):
-        plot_df = compare_samples_prep_data(**compare_samples_ui.value, **compare_samples_groups_ui.value)
-    mo.stop(plot_df is None)
-    return (plot_df,)
+    mo.stop(select_caller_ui.value is None)
+    selected_caller = select_caller_ui.value
+    comparisons = data.comparisons(selected_mark, selected_caller)
+
+    # Ask the user which comparison to view
+    select_comparison_ui = mo.ui.dropdown(**dropdown_options(
+        label="Select Comparison:",
+        options=comparisons,
+        value=get_comparison(),
+        on_change=set_comparison
+    ))
+    select_comparison_ui
+    return comparisons, select_comparison_ui, selected_caller
 
 
 @app.cell
-def _(mo, pd, plot_df, px):
-    def compare_samples_plot(df: pd.DataFrame):
-        # Make a plot of the mean abundance and log fold change
+def _(data, mo, select_comparison_ui, selected_caller, selected_mark):
+    mo.stop(select_comparison_ui.value is None)
+    selected_comparison = select_comparison_ui.value
+
+    # Get the DataFrame with the comparison
+    comp_df = data.differential_peak(
+        selected_mark,
+        selected_caller,
+        selected_comparison
+    )
+    return comp_df, selected_comparison
+
+
+@app.cell
+def _(comp_df, pd, px):
+    # Make a volcano plot
+    def make_volcano(comp_df: pd.DataFrame):
+
         fig = px.scatter(
-            df.sort_values(by="ttest_neg_log10_p", ascending=False).head(1000),
-            size="mean_abund",
-            color="mean_abund",
-            x="log10_fold_change",
-            y="ttest_neg_log10_p",
+            comp_df,
+            x="logFC",
+            y="neg_log10_pvalue",
             template="simple_white",
             hover_name="conp.id",
-            hover_data=["chrom", "start", "end", "sample.groups", "ttest_p"],
-            color_continuous_scale="bluered",
+            hover_data=["sample.groups", "FDR"],
+            size="logCPM",
+            color="is.sig",
             labels=dict(
-                mean_abund="Mean Abundance (CLR)",
-                log10_fold_change="Fold Change (log10)",
-                ttest_neg_log10_p="t-test p-vlue (-log10)",
-                ttest_p="t-test p-value"
+                logFC="Fold Change (log)",
+                neg_log10_pvalue="pvalue (-log10)",
+                logCPM="CPM (log)",
+                **{
+                    "is.sig": "Is Sig."
+                }
             )
         )
 
-        return mo.ui.plotly(fig)
+        return fig
+
+    make_volcano(comp_df)
+    return (make_volcano,)
 
 
-    compare_samples_plot_ui = compare_samples_plot(plot_df)
-    compare_samples_plot_ui
-    return compare_samples_plot, compare_samples_plot_ui
+@app.cell
+def _(comparisons, mo, selected_comparison):
+    # If there is more than one comparison available
+    mo.stop(len(comparisons) <= 1)
+
+    select_contrast_ui = mo.md("""
+    {comp}
+    {by}
+    """).batch(
+        comp=mo.ui.dropdown(
+            label="Contrast With:",
+            options=[v for v in comparisons if v != selected_comparison],
+            value=[v for v in comparisons if v != selected_comparison][0]
+        ),
+        by=mo.ui.dropdown(
+            label="Contrast Using:",
+            options=["Signed log10(pvalue)", "Fold Change (log2)"],
+            value="Signed log10(pvalue)"
+        )
+    )
+    select_contrast_ui
+    return (select_contrast_ui,)
+
+
+@app.cell
+def _(data, mo, select_contrast_ui, selected_caller, selected_mark):
+    mo.stop(select_contrast_ui.value['comp'] is None)
+    selected_contrast = select_contrast_ui.value["comp"]
+
+    # Get the DataFrame with the contrast
+    contrast_df = data.differential_peak(
+        selected_mark,
+        selected_caller,
+        selected_contrast
+    )
+    return contrast_df, selected_contrast
+
+
+@app.cell
+def _(
+    comp_df,
+    contrast_df,
+    pd,
+    px,
+    select_contrast_ui,
+    selected_comparison,
+    selected_contrast,
+):
+    def make_contrast_plot(df1: pd.DataFrame, df2: pd.DataFrame, label1: str, label2: str, by: str):
+        """
+        Constrast two different enrichment analyses.
+        """
+        by_labels = {"Signed log10(pvalue)": "signed_log10_pvalue", "Fold Change (log2)": "logFC"}
+        index_cols = ["start", "end", "sample.groups", "npeak", "length", "chrom"]
+        merged = df1.merge(
+            df2.drop(
+                columns=index_cols
+            ),
+            on="conp.id",
+            suffixes=(f" {label1}", f" {label2}"),
+            how="inner"
+        )
+
+        # Calculate the average CPM
+        merged = merged.assign(**{
+            "logCPM (mean)": (
+                merged
+                .reindex(columns=[f"logCPM {label1}", f"logCPM {label2}"])
+                .mean(axis=1)
+            )
+        })
+
+        xcol = f"{by_labels[by]} {label1}"
+        ycol = f"{by_labels[by]} {label2}"
+
+        # Make the plot
+        fig = px.scatter(
+            merged,
+            x=xcol,
+            y=ycol,
+            hover_name="conp.id",
+            hover_data=index_cols + [
+                f"{prefix} {suffix}"
+                for suffix in [label1, label2]
+                for prefix in ["is.sig"]
+            ],
+            size="logCPM (mean)",
+            labels={
+                xcol: f"{by} - {label1}",
+                ycol: f"{by} - {label2}",
+            },
+            template="simple_white"
+        )
+        return fig
+    
+
+    make_contrast_plot(
+        comp_df,
+        contrast_df,
+        selected_comparison,
+        selected_contrast,
+        select_contrast_ui.value["by"]
+    )
+    return (make_contrast_plot,)
+
+
+@app.cell
+def _(comp_df, mo):
+    # Let the user select a peak which can be inspected for its neighborhood in the genome
+    select_peak_ui = mo.md("""
+    {peak}
+
+    {window_size}
+    """).batch(
+        peak=mo.ui.dropdown(
+            label="Inspect Peak:",
+            options=comp_df["conp.id"].tolist(),
+            value=comp_df["conp.id"].values[0]
+        ),
+        window_size=mo.ui.number(
+            label="Window Size (bp):",
+            start=10000,
+            value=10000000,
+            step=1000
+        )
+    )
+    select_peak_ui
+    return (select_peak_ui,)
+
+
+@app.cell
+def _(data, go, np):
+    def display_window(mark: str, caller: str, comparison: str, peak: str, window_size: int):
+        # Get all of the peaks for this mark and caller
+        all_peaks = data.peak_annotation(mark, caller)
+
+        # Get the info for the selected peak
+        peak_info = all_peaks.loc[peak]
+
+        # Get the middle of the peak
+        peak_pos = np.mean([peak_info['Start'], peak_info['End']])
+    
+        # Calculate the window limits
+        window_start = int(peak_pos - (window_size / 2))
+        window_end = int(peak_pos + (window_size / 2))
+
+        # Filter to the peaks within the window
+        window_info = all_peaks.loc[
+            all_peaks.apply(
+                lambda r: (
+                    r["Chr"] == peak_info["Chr"]
+                    and
+                    r["Start"] > window_start
+                    and
+                    r["End"] < window_end
+                ),
+                axis=1
+            )
+        ].sort_values(by="Middle")
+
+        # Merge with the differential peaks information
+        merged = window_info.merge(data.differential_peak(mark, caller, comparison), left_index=True, right_on="conp.id")
+
+        # Add the label that will go into the plot
+        annotation_kws = [
+            'Chr',
+            'Start',
+            'End',
+            'Strand',
+            'Annotation',
+            'Distance to TSS',
+            'Gene Name',
+            'Gene Type',
+            'logFC',
+            'PValue',
+            'FDR',
+            'is.sig',
+            'is.sig2'
+        ]
+        merged = merged.assign(
+            annotation=merged.apply(
+                lambda r: '<br>'.join([f"{kw}: {r[kw]}" for kw in annotation_kws]),
+                axis=1
+            )
+        )
+
+        fig = go.Figure(layout=dict(template="simple_white"))
+
+        # Add a trace for the annotation
+        fig.add_scatter(
+            x=merged["Middle"],
+            y=[0 for _ in merged.index.values],
+            name="Annotation:",
+            mode="none",
+            text=merged["annotation"],
+            hovertemplate="%{text}<extra></extra>"
+        )
+
+        # Plot the sequencing depth per sample
+        sample_prefix = "FPKM.TMMnormalized."
+        samples = [cname for cname in merged.columns if cname.startswith(sample_prefix)]
+        for sample, fpkm in merged.reindex(columns=samples).items():
+            fig.add_scatter(
+                x=merged["Middle"],
+                y=fpkm,
+                name=sample[len(sample_prefix):]
+            )
+        fig.update_layout(
+            xaxis=dict(
+                title=dict(
+                    text=peak_info["Chr"]
+                )
+            ),
+            yaxis=dict(
+                title=dict(
+                    text="Sequencing Depth (FPKM)"
+                )
+            ),
+            hovermode="x unified"
+        )
+
+        print(merged)
+
+        return fig
+
+
+    return (display_window,)
+
+
+@app.cell
+def _(
+    display_window,
+    select_peak_ui,
+    selected_caller,
+    selected_comparison,
+    selected_mark,
+):
+    display_window(mark=selected_mark, caller=selected_caller, comparison=selected_comparison, **select_peak_ui.value)
+    return
 
 
 @app.cell
