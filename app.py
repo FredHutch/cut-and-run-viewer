@@ -305,21 +305,17 @@ def _(DataPortalDataset, Dict, List, defaultdict, mo, np, pd):
         # Key peak annotations by mark and caller
         _peak_annotations = Dict[str, Dict[str, pd.DataFrame]]
 
+        # All chromosomes
+        _all_chromosomes: set
+
         def __init__(self, ds: DataPortalDataset):
 
             self._ds = ds
 
             self.read_data()
             self.parse_differential_peaks()
+            self._all_chromosomes = set([])
             self.parse_peak_annotations()
-
-            # Make sure that all of the marks and callers (parsed from the differential peaks)
-            # also have annotations available
-            for mark in self.marks():
-                for caller in self.callers(mark):
-                    assert self.peak_annotation(mark, caller) is not None, \
-                        f"Missing annotations for {mark} / {caller}"
-        
 
         def read_data(self):
             """Read all of the CSVs in the dataset to the self.data object (keyed on filepath)."""
@@ -373,6 +369,7 @@ def _(DataPortalDataset, Dict, List, defaultdict, mo, np, pd):
 
             prefix_lower = "analysis/07_consensus_peaks_by_target/_annotation/"
             suffix_lower = ".annotation.txt"
+            self._all_chromosomes = set([])
             for key, df in self.data.items():
                 if key.lower().startswith(prefix_lower) and key.lower().endswith(suffix_lower):
                     mark, caller = key[len(prefix_lower):-len(suffix_lower)].split(".", 1)
@@ -383,7 +380,8 @@ def _(DataPortalDataset, Dict, List, defaultdict, mo, np, pd):
                             Middle=lambda d: d.apply(lambda r: np.mean([r['Start'], r['End']]), axis=1)
                         )
                     )
-    
+                    self._all_chromosomes |= set(df["Chr"].tolist())
+
         def peak_annotation(self, mark: str, caller: str):
             return self._peak_annotations.get(mark, {}).get(caller)
 
@@ -408,14 +406,22 @@ def _(DataPortalDataset, Dict, List, defaultdict, mo, np, pd):
         def marks(self) -> List[str]:
             return list(self._differential_peaks.keys())
 
-        def callers(self, mark) -> List[str]:
-            return list(self._differential_peaks[mark].keys())
+        def callers(self) -> List[str]:
+            return list(set([
+                i
+                for mark in self.marks()
+                for i in list(self._differential_peaks[mark].keys())
+            ]))
 
         def comparisons(self, mark: str, caller: str) -> List[str]:
             return list(self._differential_peaks[mark][caller].keys())
 
         def differential_peak(self, mark: str, caller: str, comparison: str) -> pd.DataFrame:
             return self._differential_peaks[mark][caller][comparison]
+
+        def all_chromosomes(self):
+            """Helper method to get a list of chromosomes in the genome."""
+            return sorted(list(self._all_chromosomes))
     return (Data,)
 
 
@@ -426,370 +432,442 @@ def _(Data, dataset):
 
 
 @app.cell
-def _(mo):
-    # Use state elements to keep the same selections even if one changes
-    get_mark, set_mark = mo.state(None)
-    get_caller, set_caller = mo.state(None)
-    get_comparison, set_comparison = mo.state(None)
-    return (
-        get_caller,
-        get_comparison,
-        get_mark,
-        set_caller,
-        set_comparison,
-        set_mark,
-    )
+def _(data, mo):
+    # Let the user pick a chromosome to display
+    # Pick the start and end positions
+    select_pos_ui = mo.md("""
+    ### View Genomic Region
 
+    {mark}
 
-@app.cell
-def _(List):
-    def dropdown_options(label: str, options: List[str], value: str, on_change: callable):
-        return dict(
-            label=label,
-            options=options,
-            value=value if value in options else None,
-            on_change=on_change
-        )
-    return (dropdown_options,)
+    {caller}
 
+    {chr}
 
-@app.cell
-def _(data, dropdown_options, get_mark, mo, set_mark):
-    # Ask the user which mark to inspect
-    select_mark_ui = mo.ui.dropdown(**dropdown_options(
-        label="Select Mark:",
-        options=data.marks(),
-        value=get_mark(),
-        on_change=set_mark
-    ))
-    select_mark_ui
-    return (select_mark_ui,)
+    {start}
 
-
-@app.cell
-def _(data, dropdown_options, get_caller, mo, select_mark_ui, set_caller):
-    mo.stop(select_mark_ui.value is None)
-    selected_mark = select_mark_ui.value
-    callers = data.callers(selected_mark)
-
-    # Ask the user which caller to use
-    select_caller_ui = mo.ui.dropdown(**dropdown_options(
-        label="Select Caller:",
-        options=callers,
-        value=get_caller(),
-        on_change=set_caller
-    ))
-    select_caller_ui
-    return callers, select_caller_ui, selected_mark
-
-
-@app.cell
-def _(
-    data,
-    dropdown_options,
-    get_comparison,
-    mo,
-    select_caller_ui,
-    selected_mark,
-    set_comparison,
-):
-    mo.stop(select_caller_ui.value is None)
-    selected_caller = select_caller_ui.value
-    comparisons = data.comparisons(selected_mark, selected_caller)
-
-    # Ask the user which comparison to view
-    select_comparison_ui = mo.ui.dropdown(**dropdown_options(
-        label="Select Comparison:",
-        options=comparisons,
-        value=get_comparison(),
-        on_change=set_comparison
-    ))
-    select_comparison_ui
-    return comparisons, select_comparison_ui, selected_caller
-
-
-@app.cell
-def _(data, mo, select_comparison_ui, selected_caller, selected_mark):
-    mo.stop(select_comparison_ui.value is None)
-    selected_comparison = select_comparison_ui.value
-
-    # Get the DataFrame with the comparison
-    comp_df = data.differential_peak(
-        selected_mark,
-        selected_caller,
-        selected_comparison
-    )
-    return comp_df, selected_comparison
-
-
-@app.cell
-def _(comp_df, pd, px):
-    # Make a volcano plot
-    def make_volcano(comp_df: pd.DataFrame):
-
-        fig = px.scatter(
-            comp_df,
-            x="logFC",
-            y="neg_log10_pvalue",
-            template="simple_white",
-            hover_name="conp.id",
-            hover_data=["sample.groups", "FDR"],
-            size="logCPM",
-            color="is.sig",
-            labels=dict(
-                logFC="Fold Change (log)",
-                neg_log10_pvalue="pvalue (-log10)",
-                logCPM="CPM (log)",
-                **{
-                    "is.sig": "Is Sig."
-                }
-            )
-        )
-
-        return fig
-
-    make_volcano(comp_df)
-    return (make_volcano,)
-
-
-@app.cell
-def _(comparisons, mo, selected_comparison):
-    # If there is more than one comparison available
-    mo.stop(len(comparisons) <= 1)
-
-    select_contrast_ui = mo.md("""
-    {comp}
-    {by}
+    {stop}
     """).batch(
-        comp=mo.ui.dropdown(
-            label="Contrast With:",
-            options=[v for v in comparisons if v != selected_comparison],
-            value=[v for v in comparisons if v != selected_comparison][0]
+        mark = mo.ui.dropdown(
+            label="Select Mark:",
+            options=data.marks(),
+            value=data.marks()[0]
         ),
-        by=mo.ui.dropdown(
-            label="Contrast Using:",
-            options=["Signed log10(pvalue)", "Fold Change (log2)"],
-            value="Signed log10(pvalue)"
-        )
-    )
-    select_contrast_ui
-    return (select_contrast_ui,)
-
-
-@app.cell
-def _(data, mo, select_contrast_ui, selected_caller, selected_mark):
-    mo.stop(select_contrast_ui.value['comp'] is None)
-    selected_contrast = select_contrast_ui.value["comp"]
-
-    # Get the DataFrame with the contrast
-    contrast_df = data.differential_peak(
-        selected_mark,
-        selected_caller,
-        selected_contrast
-    )
-    return contrast_df, selected_contrast
-
-
-@app.cell
-def _(
-    comp_df,
-    contrast_df,
-    pd,
-    px,
-    select_contrast_ui,
-    selected_comparison,
-    selected_contrast,
-):
-    def make_contrast_plot(df1: pd.DataFrame, df2: pd.DataFrame, label1: str, label2: str, by: str):
-        """
-        Constrast two different enrichment analyses.
-        """
-        by_labels = {"Signed log10(pvalue)": "signed_log10_pvalue", "Fold Change (log2)": "logFC"}
-        index_cols = ["start", "end", "sample.groups", "npeak", "length", "chrom"]
-        merged = df1.merge(
-            df2.drop(
-                columns=index_cols
-            ),
-            on="conp.id",
-            suffixes=(f" {label1}", f" {label2}"),
-            how="inner"
-        )
-
-        # Calculate the average CPM
-        merged = merged.assign(**{
-            "logCPM (mean)": (
-                merged
-                .reindex(columns=[f"logCPM {label1}", f"logCPM {label2}"])
-                .mean(axis=1)
-            )
-        })
-
-        xcol = f"{by_labels[by]} {label1}"
-        ycol = f"{by_labels[by]} {label2}"
-
-        # Make the plot
-        fig = px.scatter(
-            merged,
-            x=xcol,
-            y=ycol,
-            hover_name="conp.id",
-            hover_data=index_cols + [
-                f"{prefix} {suffix}"
-                for suffix in [label1, label2]
-                for prefix in ["is.sig"]
-            ],
-            size="logCPM (mean)",
-            labels={
-                xcol: f"{by} - {label1}",
-                ycol: f"{by} - {label2}",
-            },
-            template="simple_white"
-        )
-        return fig
-    
-
-    make_contrast_plot(
-        comp_df,
-        contrast_df,
-        selected_comparison,
-        selected_contrast,
-        select_contrast_ui.value["by"]
-    )
-    return (make_contrast_plot,)
-
-
-@app.cell
-def _(comp_df, mo):
-    # Let the user select a peak which can be inspected for its neighborhood in the genome
-    select_peak_ui = mo.md("""
-    {peak}
-
-    {window_size}
-    """).batch(
-        peak=mo.ui.dropdown(
-            label="Inspect Peak:",
-            options=comp_df["conp.id"].sort_values().tolist(),
-            value=comp_df["conp.id"].values[0]
+        caller=mo.ui.dropdown(
+            label="Select Caller:",
+            options=data.callers(),
+            value=data.callers()[0]
         ),
-        window_size=mo.ui.number(
-            label="Window Size (bp):",
-            start=10000,
-            value=10000000,
-            step=1000
+        chr=mo.ui.dropdown(
+            label="Select Chromosome",
+            options=data.all_chromosomes(),
+            value="chr1"
+        ),
+        start=mo.ui.number(
+            label="Start Position:",
+            start=1,
+            value=3000000
+        ),
+        stop=mo.ui.number(
+            label="Start Position:",
+            start=1,
+            value=6000000
         )
     )
-    select_peak_ui
-    return (select_peak_ui,)
+    select_pos_ui
+    return (select_pos_ui,)
 
 
 @app.cell
-def _(data, go, np):
-    def display_window(mark: str, caller: str, comparison: str, peak: str, window_size: int):
-        # Get all of the peaks for this mark and caller
+def _(data, select_pos_ui):
+    def display_genomic_region(
+        mark: str,
+        caller: str,
+        chr: str,
+        start: int,
+        stop: int
+    ):
+        # Get all of the peaks in the selected region
         all_peaks = data.peak_annotation(mark, caller)
-
-        # Get the info for the selected peak
-        peak_info = all_peaks.loc[peak]
-
-        # Get the middle of the peak
-        peak_pos = np.mean([peak_info['Start'], peak_info['End']])
-    
-        # Calculate the window limits
-        window_start = int(peak_pos - (window_size / 2))
-        window_end = int(peak_pos + (window_size / 2))
 
         # Filter to the peaks within the window
         window_info = all_peaks.loc[
             all_peaks.apply(
                 lambda r: (
-                    r["Chr"] == peak_info["Chr"]
+                    r["Chr"] == chr
                     and
-                    r["Start"] > window_start
+                    r["Start"] >= start
                     and
-                    r["End"] < window_end
+                    r["End"] <= stop
                 ),
                 axis=1
             )
         ].sort_values(by="Middle")
 
-        # Merge with the differential peaks information
-        merged = window_info.merge(data.differential_peak(mark, caller, comparison), left_index=True, right_on="conp.id")
+        return window_info
 
-        # Add the label that will go into the plot
-        annotation_kws = [
-            'Chr',
-            'Start',
-            'End',
-            'Strand',
-            'Annotation',
-            'Distance to TSS',
-            'Gene Name',
-            'Gene Type',
-            'logFC',
-            'PValue',
-            'FDR',
-            'is.sig',
-            'is.sig2'
-        ]
-        merged = merged.assign(
-            annotation=merged.apply(
-                lambda r: '<br>'.join([f"{kw}: {r[kw]}" for kw in annotation_kws]),
-                axis=1
-            )
-        )
+        # # Merge with the differential peaks information
+        # merged = window_info.merge(data.differential_peak(mark, caller, comparison), left_index=True, right_on="conp.id")
 
-        fig = go.Figure(layout=dict(template="simple_white"))
-
-        # Add a trace for the annotation
-        fig.add_scatter(
-            x=merged["Middle"],
-            y=[0 for _ in merged.index.values],
-            name="Annotation:",
-            mode="none",
-            text=merged["annotation"],
-            hovertemplate="%{text}<extra></extra>"
-        )
-
-        # Plot the sequencing depth per sample
-        sample_prefix = "FPKM.TMMnormalized."
-        samples = [cname for cname in merged.columns if cname.startswith(sample_prefix)]
-        for sample, fpkm in merged.reindex(columns=samples).items():
-            fig.add_scatter(
-                x=merged["Middle"],
-                y=fpkm,
-                name=sample[len(sample_prefix):]
-            )
-        fig.update_layout(
-            xaxis=dict(
-                title=dict(
-                    text=peak_info["Chr"]
-                )
-            ),
-            yaxis=dict(
-                title=dict(
-                    text="Sequencing Depth (FPKM)"
-                )
-            ),
-            hovermode="x unified"
-        )
-
-        print(merged)
-
-        return fig
+        # # Add the label that will go into the plot
+        # annotation_kws = [
+        #     'Chr',
+        #     'Start',
+        #     'End',
+        #     'Strand',
+        #     'Annotation',
+        #     'Distance to TSS',
+        #     'Gene Name',
+        #     'Gene Type',
+        #     'logFC',
+        #     'PValue',
+        #     'FDR',
+        #     'is.sig',
+        #     'is.sig2'
+        # ]
+        # merged = merged.assign(
+        #     annotation=merged.apply(
+        #         lambda r: '<br>'.join([f"{kw}: {r[kw]}" for kw in annotation_kws]),
+        #         axis=1
+        #     )
+        # )
 
 
-    return (display_window,)
+    display_genomic_region(**select_pos_ui.value)
+    return (display_genomic_region,)
 
 
 @app.cell
-def _(
-    display_window,
-    select_peak_ui,
-    selected_caller,
-    selected_comparison,
-    selected_mark,
-):
-    display_window(mark=selected_mark, caller=selected_caller, comparison=selected_comparison, **select_peak_ui.value)
+def _():
+    return
+
+
+@app.cell
+def _():
+    # # Use state elements to keep the same selections even if one changes
+    # get_mark, set_mark = mo.state(None)
+    # get_caller, set_caller = mo.state(None)
+    # get_comparison, set_comparison = mo.state(None)
+    return
+
+
+@app.cell
+def _():
+    # def dropdown_options(label: str, options: List[str], value: str, on_change: callable):
+    #     return dict(
+    #         label=label,
+    #         options=options,
+    #         value=value if value in options else None,
+    #         on_change=on_change
+    #     )
+    return
+
+
+@app.cell
+def _():
+    return
+
+
+@app.cell
+def _():
+    # mo.stop(select_mark_ui.value is None)
+    # selected_mark = select_mark_ui.value
+    # callers = data.callers(selected_mark)
+
+    # # Ask the user which caller to use
+    # select_caller_ui = mo.ui.dropdown(**dropdown_options(
+    #     label="Select Caller:",
+    #     options=callers,
+    #     value=get_caller(),
+    #     on_change=set_caller
+    # ))
+    # select_caller_ui
+    return
+
+
+@app.cell
+def _():
+    # mo.stop(select_caller_ui.value is None)
+    # selected_caller = select_caller_ui.value
+    # comparisons = data.comparisons(selected_mark, selected_caller)
+
+    # # Ask the user which comparison to view
+    # select_comparison_ui = mo.ui.dropdown(**dropdown_options(
+    #     label="Select Comparison:",
+    #     options=comparisons,
+    #     value=get_comparison(),
+    #     on_change=set_comparison
+    # ))
+    # select_comparison_ui
+    return
+
+
+@app.cell
+def _():
+    # mo.stop(select_comparison_ui.value is None)
+    # selected_comparison = select_comparison_ui.value
+
+    # # Get the DataFrame with the comparison
+    # comp_df = data.differential_peak(
+    #     selected_mark,
+    #     selected_caller,
+    #     selected_comparison
+    # )
+    return
+
+
+@app.cell
+def _():
+    # # Make a volcano plot
+    # def make_volcano(comp_df: pd.DataFrame):
+
+    #     fig = px.scatter(
+    #         comp_df,
+    #         x="logFC",
+    #         y="neg_log10_pvalue",
+    #         template="simple_white",
+    #         hover_name="conp.id",
+    #         hover_data=["sample.groups", "FDR"],
+    #         size="logCPM",
+    #         color="is.sig",
+    #         labels=dict(
+    #             logFC="Fold Change (log)",
+    #             neg_log10_pvalue="pvalue (-log10)",
+    #             logCPM="CPM (log)",
+    #             **{
+    #                 "is.sig": "Is Sig."
+    #             }
+    #         )
+    #     )
+
+    #     return fig
+
+    # make_volcano(comp_df)
+    return
+
+
+@app.cell
+def _():
+    # # If there is more than one comparison available
+    # mo.stop(len(comparisons) <= 1)
+
+    # select_contrast_ui = mo.md("""
+    # {comp}
+    # {by}
+    # """).batch(
+    #     comp=mo.ui.dropdown(
+    #         label="Contrast With:",
+    #         options=[v for v in comparisons if v != selected_comparison],
+    #         value=[v for v in comparisons if v != selected_comparison][0]
+    #     ),
+    #     by=mo.ui.dropdown(
+    #         label="Contrast Using:",
+    #         options=["Signed log10(pvalue)", "Fold Change (log2)"],
+    #         value="Signed log10(pvalue)"
+    #     )
+    # )
+    # select_contrast_ui
+    return
+
+
+@app.cell
+def _():
+    # mo.stop(select_contrast_ui.value['comp'] is None)
+    # selected_contrast = select_contrast_ui.value["comp"]
+
+    # # Get the DataFrame with the contrast
+    # contrast_df = data.differential_peak(
+    #     selected_mark,
+    #     selected_caller,
+    #     selected_contrast
+    # )
+    return
+
+
+@app.cell
+def _():
+    # def make_contrast_plot(df1: pd.DataFrame, df2: pd.DataFrame, label1: str, label2: str, by: str):
+    #     """
+    #     Constrast two different enrichment analyses.
+    #     """
+    #     by_labels = {"Signed log10(pvalue)": "signed_log10_pvalue", "Fold Change (log2)": "logFC"}
+    #     index_cols = ["start", "end", "sample.groups", "npeak", "length", "chrom"]
+    #     merged = df1.merge(
+    #         df2.drop(
+    #             columns=index_cols
+    #         ),
+    #         on="conp.id",
+    #         suffixes=(f" {label1}", f" {label2}"),
+    #         how="inner"
+    #     )
+
+    #     # Calculate the average CPM
+    #     merged = merged.assign(**{
+    #         "logCPM (mean)": (
+    #             merged
+    #             .reindex(columns=[f"logCPM {label1}", f"logCPM {label2}"])
+    #             .mean(axis=1)
+    #         )
+    #     })
+
+    #     xcol = f"{by_labels[by]} {label1}"
+    #     ycol = f"{by_labels[by]} {label2}"
+
+    #     # Make the plot
+    #     fig = px.scatter(
+    #         merged,
+    #         x=xcol,
+    #         y=ycol,
+    #         hover_name="conp.id",
+    #         hover_data=index_cols + [
+    #             f"{prefix} {suffix}"
+    #             for suffix in [label1, label2]
+    #             for prefix in ["is.sig"]
+    #         ],
+    #         size="logCPM (mean)",
+    #         labels={
+    #             xcol: f"{by} - {label1}",
+    #             ycol: f"{by} - {label2}",
+    #         },
+    #         template="simple_white"
+    #     )
+    #     return fig
+
+
+    # make_contrast_plot(
+    #     comp_df,
+    #     contrast_df,
+    #     selected_comparison,
+    #     selected_contrast,
+    #     select_contrast_ui.value["by"]
+    # )
+    return
+
+
+@app.cell
+def _():
+    # # Let the user select a peak which can be inspected for its neighborhood in the genome
+    # select_peak_ui = mo.md("""
+    # {peak}
+
+    # {window_size}
+    # """).batch(
+    #     peak=mo.ui.dropdown(
+    #         label="Inspect Peak:",
+    #         options=comp_df["conp.id"].sort_values().tolist(),
+    #         value=comp_df["conp.id"].values[0]
+    #     ),
+    #     window_size=mo.ui.number(
+    #         label="Window Size (bp):",
+    #         start=10000,
+    #         value=10000000,
+    #         step=1000
+    #     )
+    # )
+    # select_peak_ui
+    return
+
+
+@app.cell
+def _():
+    # def display_window(mark: str, caller: str, comparison: str, peak: str, window_size: int):
+    #     # Get all of the peaks for this mark and caller
+    #     all_peaks = data.peak_annotation(mark, caller)
+
+    #     # Get the info for the selected peak
+    #     peak_info = all_peaks.loc[peak]
+
+    #     # Get the middle of the peak
+    #     peak_pos = np.mean([peak_info['Start'], peak_info['End']])
+
+    #     # Calculate the window limits
+    #     window_start = int(peak_pos - (window_size / 2))
+    #     window_end = int(peak_pos + (window_size / 2))
+
+    #     # Filter to the peaks within the window
+    #     window_info = all_peaks.loc[
+    #         all_peaks.apply(
+    #             lambda r: (
+    #                 r["Chr"] == peak_info["Chr"]
+    #                 and
+    #                 r["Start"] > window_start
+    #                 and
+    #                 r["End"] < window_end
+    #             ),
+    #             axis=1
+    #         )
+    #     ].sort_values(by="Middle")
+
+    #     # Merge with the differential peaks information
+    #     merged = window_info.merge(data.differential_peak(mark, caller, comparison), left_index=True, right_on="conp.id")
+
+    #     # Add the label that will go into the plot
+    #     annotation_kws = [
+    #         'Chr',
+    #         'Start',
+    #         'End',
+    #         'Strand',
+    #         'Annotation',
+    #         'Distance to TSS',
+    #         'Gene Name',
+    #         'Gene Type',
+    #         'logFC',
+    #         'PValue',
+    #         'FDR',
+    #         'is.sig',
+    #         'is.sig2'
+    #     ]
+    #     merged = merged.assign(
+    #         annotation=merged.apply(
+    #             lambda r: '<br>'.join([f"{kw}: {r[kw]}" for kw in annotation_kws]),
+    #             axis=1
+    #         )
+    #     )
+
+    #     fig = go.Figure(layout=dict(template="simple_white"))
+
+    #     # Add a trace for the annotation
+    #     fig.add_scatter(
+    #         x=merged["Middle"],
+    #         y=[0 for _ in merged.index.values],
+    #         name="Annotation:",
+    #         mode="none",
+    #         text=merged["annotation"],
+    #         hovertemplate="%{text}<extra></extra>"
+    #     )
+
+    #     # Plot the sequencing depth per sample
+    #     sample_prefix = "FPKM.TMMnormalized."
+    #     samples = [cname for cname in merged.columns if cname.startswith(sample_prefix)]
+    #     for sample, fpkm in merged.reindex(columns=samples).items():
+    #         fig.add_scatter(
+    #             x=merged["Middle"],
+    #             y=fpkm,
+    #             name=sample[len(sample_prefix):]
+    #         )
+    #     fig.update_layout(
+    #         xaxis=dict(
+    #             title=dict(
+    #                 text=peak_info["Chr"]
+    #             )
+    #         ),
+    #         yaxis=dict(
+    #             title=dict(
+    #                 text="Sequencing Depth (FPKM)"
+    #             )
+    #         ),
+    #         hovermode="x unified"
+    #     )
+
+    #     return merged
+
+    #     return fig
+    return
+
+
+@app.cell
+def _():
+    # display_window(mark=selected_mark, caller=selected_caller, comparison=selected_comparison, **select_peak_ui.value)
     return
 
 
